@@ -54,9 +54,11 @@ public:
 
     LibraryHooks::RegisterLibraryHook("d3d11.dll", NULL);
 
-    CreateDevice.Register("d3d11.dll", "D3D11CreateDevice", D3D11CreateDevice_hook);
-    CreateDeviceAndSwapChain.Register("d3d11.dll", "D3D11CreateDeviceAndSwapChain",
-                                      D3D11CreateDeviceAndSwapChain_hook);
+    // Some applications resolve and cache graphics exports through paths not covered by import
+    // tables or GetProcAddress. Ask the Windows hook implementation to cover those paths too.
+    CreateDevice.RegisterDirect("d3d11.dll", "D3D11CreateDevice", D3D11CreateDevice_hook);
+    CreateDeviceAndSwapChain.RegisterDirect("d3d11.dll", "D3D11CreateDeviceAndSwapChain",
+                                            D3D11CreateDeviceAndSwapChain_hook);
 
     m_RecurseSlot = Threading::AllocateTLSSlot();
     Threading::SetTLSValue(m_RecurseSlot, NULL);

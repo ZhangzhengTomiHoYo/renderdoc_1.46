@@ -251,9 +251,11 @@ public:
 
     LibraryHooks::RegisterLibraryHook("dxgi.dll", NULL);
 
-    CreateDXGIFactory.Register("dxgi.dll", "CreateDXGIFactory", CreateDXGIFactory_hook);
-    CreateDXGIFactory1.Register("dxgi.dll", "CreateDXGIFactory1", CreateDXGIFactory1_hook);
-    CreateDXGIFactory2.Register("dxgi.dll", "CreateDXGIFactory2", CreateDXGIFactory2_hook);
+    // Keep DXGI factory creation on the same direct-export path as D3D11 device creation. Some
+    // applications resolve both sets of exports outside the process IAT or GetProcAddress paths.
+    CreateDXGIFactory.RegisterDirect("dxgi.dll", "CreateDXGIFactory", CreateDXGIFactory_hook);
+    CreateDXGIFactory1.RegisterDirect("dxgi.dll", "CreateDXGIFactory1", CreateDXGIFactory1_hook);
+    CreateDXGIFactory2.RegisterDirect("dxgi.dll", "CreateDXGIFactory2", CreateDXGIFactory2_hook);
     GetDebugInterface.Register("dxgi.dll", "DXGIGetDebugInterface", DXGIGetDebugInterface_hook);
     GetDebugInterface1.Register("dxgi.dll", "DXGIGetDebugInterface1", DXGIGetDebugInterface1_hook);
   }

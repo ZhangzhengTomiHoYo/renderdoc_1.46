@@ -31,6 +31,7 @@
 #include <tlhelp32.h>
 #include "common/formatting.h"
 #include "core/core.h"
+#include "hooks/hooks.h"
 #include "os/os_specific.h"
 #include "strings/string_utils.h"
 
@@ -247,6 +248,15 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_EnvMod(EnvMod *mod)
 extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignored)
 {
   Process::ApplyEnvironmentModification();
+}
+
+extern "C" __declspec(dllexport) void __cdecl INTERNAL_InstallDirectHooks(void *ignored)
+{
+  // This is invoked on a remote worker thread during injection. For suspended launches it runs
+  // before the target's main thread is resumed, preventing an early unwrapped export from being
+  // cached before the target-control connection is established.
+  RDCLOG("Installing direct graphics hooks during injection");
+  LibraryHooks::Refresh();
 }
 
 void InjectDLL(HANDLE hProcess, rdcwstr libName)
@@ -1010,6 +1020,12 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
     InjectFunctionCall(hProcess, loc, "INTERNAL_SetCaptureOptions", (CaptureOptions *)&opts,
                        sizeof(CaptureOptions));
+
+    // Parameter is unused. Keep a non-zero buffer size because InjectFunctionCall uses the same
+    // transport for all internal helpers.
+    void *directHookDummy = NULL;
+    InjectFunctionCall(hProcess, loc, "INTERNAL_InstallDirectHooks", &directHookDummy,
+                       sizeof(directHookDummy));
 
     InjectFunctionCall(hProcess, loc, "INTERNAL_GetTargetControlIdent", &result.second,
                        sizeof(result.second));
