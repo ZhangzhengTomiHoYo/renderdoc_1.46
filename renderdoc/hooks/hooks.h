@@ -31,12 +31,20 @@ typedef std::function<void(void *, const char *)> FunctionLoadCallback;
 
 struct FunctionHook
 {
-  FunctionHook() : orig(NULL), hook(NULL) {}
-  FunctionHook(const char *f, void **o, void *d) : function(f), orig(o), hook(d) {}
+  FunctionHook() : orig(NULL), hook(NULL), direct(false) {}
+  FunctionHook(const char *f, void **o, void *d, bool directHook = false)
+      : function(f), orig(o), hook(d), direct(directHook)
+  {
+  }
   bool operator<(const FunctionHook &h) const { return function < h.function; }
   rdcstr function;
   void **orig;
   void *hook;
+  // Windows normally patches import tables and GetProcAddress. A small number of protected
+  // applications resolve graphics exports themselves, bypassing both paths. These hooks may also
+  // be installed in the exporting module's EAT on Windows, with the original entry point retained
+  // in orig for onward calls.
+  bool direct;
 };
 
 // == Hooking workflow overview ==
@@ -207,6 +215,11 @@ public:
   {
     LibraryHooks::RegisterFunctionHook(
         module_name, FunctionHook(function, &orig_funcptr, destination_function_ptr));
+  }
+  void RegisterDirect(const char *module_name, const char *function, void *destination_function_ptr)
+  {
+    LibraryHooks::RegisterFunctionHook(
+        module_name, FunctionHook(function, &orig_funcptr, destination_function_ptr, true));
   }
 
 private:

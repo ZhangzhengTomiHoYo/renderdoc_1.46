@@ -43,6 +43,17 @@
 std::map<void **, void *> s_InstalledHooks;
 Threading::CriticalSection installedLock;
 
+struct DirectExportHook
+{
+  HMODULE module = NULL;
+  DWORD *entry = NULL;
+  DWORD originalRVA = 0;
+  DWORD hookRVA = 0;
+  void *relay = NULL;
+};
+
+rdcarray<DirectExportHook> s_DirectExportHooks;
+
 bool ApplyHook(FunctionHook &hook, void **IATentry, bool &already)
 {
   DWORD oldProtection = PAGE_EXECUTE;
@@ -79,6 +90,310 @@ bool ApplyHook(FunctionHook &hook, void **IATentry, bool &already)
     return false;
   }
 
+  return true;
+}
+
+static bool IsReadableModuleRange(HMODULE module, const void *ptr, size_t size)
+{
+  if(module == NULL || ptr == NULL)
+    return false;
+
+  if(size == 0)
+    return true;
+
+  const uintptr_t moduleBase = (uintptr_t)module;
+  uintptr_t cursor = (uintptr_t)ptr;
+
+  if(cursor < moduleBase || size > UINTPTR_MAX - cursor)
+    return false;
+
+  const uintptr_t end = cursor + size;
+
+  while(cursor < end)
+  {
+    MEMORY_BASIC_INFORMATION mem = {};
+    if(VirtualQuery((const void *)cursor, &mem, sizeof(mem)) == 0 || mem.State != MEM_COMMIT ||
+       mem.AllocationBase != (void *)module || (mem.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0)
+      return false;
+
+    const uintptr_t regionBase = (uintptr_t)mem.BaseAddress;
+    if(regionBase > cursor || mem.RegionSize > UINTPTR_MAX - regionBase)
+      return false;
+
+    const uintptr_t regionEnd = regionBase + mem.RegionSize;
+    if(regionEnd <= cursor)
+      return false;
+
+    cursor = RDCMIN(end, regionEnd);
+  }
+
+  return true;
+}
+
+static bool IsImageRangeValid(size_t imageSize, size_t rva, size_t size)
+{
+  return rva <= imageSize && size <= imageSize - rva;
+}
+
+static bool ReadImageString(HMODULE module, const byte *base, size_t imageSize, size_t rva,
+                             rdcstr &value)
+{
+  value.clear();
+
+  if(!IsImageRangeValid(imageSize, rva, 1))
+    return false;
+
+  const size_t maxLength = RDCMIN((size_t)4096, imageSize - rva);
+  for(size_t i = 0; i < maxLength; ++i)
+  {
+    const char *character = (const char *)(base + rva + i);
+    if(!IsReadableModuleRange(module, character, 1))
+      return false;
+
+    if(*character == 0)
+      return true;
+
+    value.push_back(*character);
+  }
+
+  value.clear();
+  return false;
+}
+
+static bool GetModuleImageSize(HMODULE module, byte *&base, size_t &imageSize)
+{
+  base = (byte *)module;
+  imageSize = 0;
+
+  if(!IsReadableModuleRange(module, base, sizeof(IMAGE_DOS_HEADER)))
+    return false;
+
+  const IMAGE_DOS_HEADER *dosHeader = (const IMAGE_DOS_HEADER *)base;
+  if(dosHeader->e_magic != IMAGE_DOS_SIGNATURE || dosHeader->e_lfanew < 0)
+    return false;
+
+  const size_t ntOffset = (size_t)dosHeader->e_lfanew;
+  if(ntOffset > UINTPTR_MAX - (uintptr_t)base ||
+     !IsReadableModuleRange(module, base + ntOffset, sizeof(IMAGE_NT_HEADERS)))
+    return false;
+
+  const IMAGE_NT_HEADERS *ntHeaders = (const IMAGE_NT_HEADERS *)(base + ntOffset);
+  if(ntHeaders->Signature != IMAGE_NT_SIGNATURE)
+    return false;
+
+  imageSize = ntHeaders->OptionalHeader.SizeOfImage;
+  return imageSize != 0 && imageSize <= UINTPTR_MAX - (uintptr_t)base;
+}
+
+static DWORD *FindExportAddressEntry(HMODULE module, const char *function)
+{
+  byte *base = NULL;
+  size_t imageSize = 0;
+  if(function == NULL || !GetModuleImageSize(module, base, imageSize))
+    return NULL;
+
+  const IMAGE_DOS_HEADER *dosHeader = (const IMAGE_DOS_HEADER *)base;
+  const IMAGE_NT_HEADERS *ntHeaders =
+      (const IMAGE_NT_HEADERS *)(base + (size_t)dosHeader->e_lfanew);
+  if(ntHeaders->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT)
+    return NULL;
+
+  const IMAGE_DATA_DIRECTORY &exportDirectory =
+      ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+  if(exportDirectory.VirtualAddress == 0 ||
+     !IsImageRangeValid(imageSize, exportDirectory.VirtualAddress,
+                        sizeof(IMAGE_EXPORT_DIRECTORY)))
+    return NULL;
+
+  const IMAGE_EXPORT_DIRECTORY *exports =
+      (const IMAGE_EXPORT_DIRECTORY *)(base + exportDirectory.VirtualAddress);
+  if(!IsReadableModuleRange(module, exports, sizeof(*exports)) ||
+     !IsImageRangeValid(imageSize, exports->AddressOfFunctions,
+                        (size_t)exports->NumberOfFunctions * sizeof(DWORD)) ||
+     !IsImageRangeValid(imageSize, exports->AddressOfNames,
+                        (size_t)exports->NumberOfNames * sizeof(DWORD)) ||
+     !IsImageRangeValid(imageSize, exports->AddressOfNameOrdinals,
+                        (size_t)exports->NumberOfNames * sizeof(WORD)))
+    return NULL;
+
+  DWORD *functions = (DWORD *)(base + exports->AddressOfFunctions);
+  const DWORD *names = (const DWORD *)(base + exports->AddressOfNames);
+  const WORD *ordinals = (const WORD *)(base + exports->AddressOfNameOrdinals);
+  if(!IsReadableModuleRange(module, functions,
+                            (size_t)exports->NumberOfFunctions * sizeof(DWORD)) ||
+     !IsReadableModuleRange(module, names, (size_t)exports->NumberOfNames * sizeof(DWORD)) ||
+     !IsReadableModuleRange(module, ordinals, (size_t)exports->NumberOfNames * sizeof(WORD)))
+    return NULL;
+
+  for(DWORD i = 0; i < exports->NumberOfNames; ++i)
+  {
+    rdcstr exportName;
+    if(ordinals[i] < exports->NumberOfFunctions &&
+       ReadImageString(module, base, imageSize, names[i], exportName) && exportName == function)
+      return &functions[ordinals[i]];
+  }
+
+  return NULL;
+}
+
+static void *AllocateDirectExportRelay(HMODULE module, void *hook)
+{
+  byte *base = NULL;
+  size_t imageSize = 0;
+  if(!GetModuleImageSize(module, base, imageSize))
+    return NULL;
+
+  SYSTEM_INFO systemInfo = {};
+  GetSystemInfo(&systemInfo);
+  const uintptr_t granularity = systemInfo.dwAllocationGranularity;
+  const uintptr_t pageSize = systemInfo.dwPageSize;
+  const uintptr_t moduleBase = (uintptr_t)base;
+  const uintptr_t maximumApplicationAddress = (uintptr_t)systemInfo.lpMaximumApplicationAddress;
+
+  uintptr_t maximumAddress = moduleBase + UINT32_MAX;
+  if(maximumAddress < moduleBase || maximumAddress > maximumApplicationAddress)
+    maximumAddress = maximumApplicationAddress;
+
+  uintptr_t cursor = moduleBase + imageSize;
+  if(cursor < moduleBase || cursor > UINTPTR_MAX - (granularity - 1))
+    return NULL;
+  cursor = (cursor + granularity - 1) & ~(granularity - 1);
+
+  while(cursor <= maximumAddress && pageSize <= maximumAddress - cursor + 1)
+  {
+    MEMORY_BASIC_INFORMATION memory = {};
+    if(VirtualQuery((void *)cursor, &memory, sizeof(memory)) == 0)
+      break;
+
+    const uintptr_t regionBase = (uintptr_t)memory.BaseAddress;
+    if(memory.RegionSize > UINTPTR_MAX - regionBase)
+      break;
+    const uintptr_t regionEnd = regionBase + memory.RegionSize;
+
+    if(memory.State == MEM_FREE)
+    {
+      uintptr_t candidate = RDCMAX(cursor, regionBase);
+      if(candidate <= UINTPTR_MAX - (granularity - 1))
+        candidate = (candidate + granularity - 1) & ~(granularity - 1);
+
+      if(candidate < regionEnd && candidate <= maximumAddress && pageSize <= regionEnd - candidate &&
+         pageSize <= maximumAddress - candidate + 1)
+      {
+        void *relay = VirtualAlloc((void *)candidate, pageSize, MEM_RESERVE | MEM_COMMIT,
+                                   PAGE_READWRITE);
+        if(relay)
+        {
+#if ENABLED(RDOC_X64)
+          // endbr64; jmp qword ptr [rip]; hook. The endbr64 prefix keeps the relay valid for targets
+          // using hardware indirect-branch tracking, and the indirect jump does not clobber a
+          // register before entering the real hook.
+          byte code[] = {0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x25, 0, 0, 0,
+                         0,    0,    0,    0,    0,    0,    0, 0, 0};
+          memcpy(code + 10, &hook, sizeof(hook));
+#else
+          // mov eax, hook; jmp eax
+          byte code[] = {0xb8, 0, 0, 0, 0, 0xff, 0xe0};
+          memcpy(code + 1, &hook, sizeof(hook));
+#endif
+          memcpy(relay, code, sizeof(code));
+          FlushInstructionCache(GetCurrentProcess(), relay, sizeof(code));
+
+          DWORD oldProtection = 0;
+          if(VirtualProtect(relay, pageSize, PAGE_EXECUTE_READ, &oldProtection))
+            return relay;
+
+          VirtualFree(relay, 0, MEM_RELEASE);
+        }
+      }
+    }
+
+    if(regionEnd <= cursor)
+      break;
+    cursor = regionEnd;
+  }
+
+  return NULL;
+}
+
+static bool ApplyDirectExportHook(HMODULE module, FunctionHook &hook)
+{
+  DWORD *entry = FindExportAddressEntry(module, hook.function.c_str());
+  if(entry == NULL)
+  {
+    RDCWARN("Couldn't find export entry for direct hook %s", hook.function.c_str());
+    return false;
+  }
+
+  SCOPED_LOCK(installedLock);
+
+  for(DirectExportHook &installed : s_DirectExportHooks)
+  {
+    if(installed.entry != entry)
+      continue;
+
+    if(*entry == installed.hookRVA)
+      return true;
+
+    if(*entry != installed.originalRVA)
+    {
+      RDCWARN("Direct export hook %s was replaced by another target; leaving it unchanged",
+              hook.function.c_str());
+      return false;
+    }
+
+    DWORD oldProtection = 0;
+    if(!VirtualProtect(entry, sizeof(*entry), PAGE_READWRITE, &oldProtection))
+      return false;
+    *entry = installed.hookRVA;
+    VirtualProtect(entry, sizeof(*entry), oldProtection, &oldProtection);
+    RDCLOG("Restored direct export hook for %s", hook.function.c_str());
+    return true;
+  }
+
+  FARPROC original = GetProcAddress(module, hook.function.c_str());
+  if(original == NULL)
+    return false;
+
+  if(hook.orig && *hook.orig == NULL)
+    *hook.orig = (void *)original;
+
+  const uintptr_t moduleBase = (uintptr_t)module;
+  uintptr_t target = (uintptr_t)hook.hook;
+  void *relay = NULL;
+
+  if(target < moduleBase || target - moduleBase > UINT32_MAX)
+  {
+    relay = AllocateDirectExportRelay(module, hook.hook);
+    if(relay == NULL)
+    {
+      RDCWARN("Couldn't allocate an export relay for direct hook %s", hook.function.c_str());
+      return false;
+    }
+    target = (uintptr_t)relay;
+  }
+
+  DirectExportHook installed;
+  installed.module = module;
+  installed.entry = entry;
+  installed.originalRVA = *entry;
+  installed.hookRVA = (DWORD)(target - moduleBase);
+  installed.relay = relay;
+
+  DWORD oldProtection = 0;
+  if(!VirtualProtect(entry, sizeof(*entry), PAGE_READWRITE, &oldProtection))
+  {
+    if(relay)
+      VirtualFree(relay, 0, MEM_RELEASE);
+    return false;
+  }
+
+  *entry = installed.hookRVA;
+  BOOL protectedAgain = VirtualProtect(entry, sizeof(*entry), oldProtection, &oldProtection);
+  if(!protectedAgain)
+    RDCWARN("Couldn't restore protection after direct export hook %s", hook.function.c_str());
+
+  s_DirectExportHooks.push_back(installed);
+  RDCLOG("Installed direct export hook for %s", hook.function.c_str());
   return true;
 }
 
@@ -161,6 +476,10 @@ struct CachedHookData
 
   int32_t posthooking = 0;
 
+  // Direct export changes are deliberately deferred until Refresh() runs on a normal worker
+  // thread. EndHookRegistration can execute while the loader lock is held.
+  bool directHooksEnabled = false;
+
   void ApplyHooks(const char *modName, HMODULE module)
   {
     char lowername[512] = {};
@@ -191,11 +510,15 @@ struct CachedHookData
        strstr(lowername, STRINGIZE(RDOC_BASE_NAME) ".dll") == lowername)
       return;
 
+    DllHookset *exportHookset = NULL;
+
     // set module pointer if we are hooking exports from this module
     for(auto it = DllHooks.begin(); it != DllHooks.end(); ++it)
     {
       if(!_stricmp(it->first.c_str(), modName))
       {
+        exportHookset = &it->second;
+
         if(it->second.module == NULL)
         {
           it->second.module = module;
@@ -262,6 +585,16 @@ struct CachedHookData
           }
         }
       }
+    }
+
+    // Normal Windows hooking only modifies import tables and GetProcAddress. For explicitly marked
+    // graphics entry points, also patch the exporting module so callers which parse the EAT
+    // themselves still receive the wrapper. The real address was fetched above before this change.
+    if(directHooksEnabled && exportHookset)
+    {
+      for(FunctionHook &hook : exportHookset->FunctionHooks)
+        if(hook.direct)
+          ApplyDirectExportHook(module, hook);
     }
 
     // for safety (and because we don't need to), ignore these modules
@@ -518,6 +851,46 @@ struct CachedHookData
     }
 
     FreeLibrary(refcountModHandle);
+  }
+
+  void RefreshDirectHooks()
+  {
+    directHooksEnabled = true;
+
+    rdcarray<rdcstr> directLibraries;
+
+    for(auto it = DllHooks.begin(); it != DllHooks.end(); ++it)
+    {
+      for(const FunctionHook &hook : it->second.FunctionHooks)
+      {
+        if(hook.direct)
+        {
+          directLibraries.push_back(it->first);
+          break;
+        }
+      }
+    }
+
+    for(const rdcstr &library : directLibraries)
+    {
+      HMODULE module = GetModuleHandleA(library.c_str());
+      bool preloaded = false;
+
+      // Refresh runs on a normal worker thread, outside DllMain. Loading here closes the race where
+      // a protected application resolves an export itself immediately after loading the DLL.
+      if(module == NULL)
+      {
+        module = LoadLibraryA(library.c_str());
+        preloaded = module != NULL;
+      }
+
+      if(module)
+      {
+        if(preloaded)
+          RDCLOG("Preloaded %s for direct export hooks", library.c_str());
+        ApplyHooks(library.c_str(), module);
+      }
+    }
   }
 };
 
@@ -980,7 +1353,10 @@ void LibraryHooks::EndHookRegistration()
 
 void LibraryHooks::Refresh()
 {
-  // don't need to refresh on windows
+  if(s_HookData == NULL || !s_HookData->hookAll)
+    return;
+
+  s_HookData->RefreshDirectHooks();
 }
 
 void LibraryHooks::ReplayInitialise()
@@ -990,6 +1366,26 @@ void LibraryHooks::ReplayInitialise()
 void LibraryHooks::RemoveHooks()
 {
   LibraryHooks::RemoveHookCallbacks();
+
+  for(DirectExportHook &hook : s_DirectExportHooks)
+  {
+    MEMORY_BASIC_INFORMATION memory = {};
+    if(VirtualQuery(hook.entry, &memory, sizeof(memory)) != 0 && memory.State == MEM_COMMIT &&
+       memory.AllocationBase == hook.module)
+    {
+      DWORD oldProtection = PAGE_EXECUTE;
+      if(VirtualProtect(hook.entry, sizeof(*hook.entry), PAGE_READWRITE, &oldProtection))
+      {
+        if(*hook.entry == hook.hookRVA)
+          *hook.entry = hook.originalRVA;
+        VirtualProtect(hook.entry, sizeof(*hook.entry), oldProtection, &oldProtection);
+      }
+    }
+
+    if(hook.relay)
+      VirtualFree(hook.relay, 0, MEM_RELEASE);
+  }
+  s_DirectExportHooks.clear();
 
   for(auto it = s_InstalledHooks.begin(); it != s_InstalledHooks.end(); ++it)
   {
