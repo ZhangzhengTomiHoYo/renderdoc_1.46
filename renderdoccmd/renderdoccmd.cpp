@@ -1609,7 +1609,7 @@ int renderdoccmd(GlobalEnvironment &env, std::vector<std::string> &argv)
 
     cmdline::parser cmd;
 
-    cmd.set_program_name("renderdoccmd");
+    cmd.set_program_name("zrendercmd");
     cmd.set_header(command);
 
     it->second->AddOptions(cmd);
