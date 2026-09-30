@@ -25,6 +25,10 @@
 文件声明使用 code_page(1252)，保存时保持 Windows-1252 编码。不要只把 © 打回去，却以另一种编码保存，导致资源编译器读到的字符仍不对。这是本次额外产生的问题，不是文章漏列的改名步骤。
 </div>
 
+## 2026-09-30 提交前复查：版权行已再次恢复
+
+提交前已把版权行恢复为 `Copyright © 2026 Baldur Karlsson`。当前 `renderdoc.rc` 相对基线只保留 `FileDescription` 和 `ProductName` 两项 ZRender 品牌修改，不再包含问号损坏。
+
 `InternalName` 和 `OriginalFilename` 仍是旧名称，暂时不算第 07 篇漏改：它们不是这两项显示文字的依赖，也不会控制真正的 DLL 文件名。
 
 另外，普通 Git 差异把 `.rc` 显示为二进制，是因为仓库 `.gitattributes` 指定了 `*.rc binary`，不是你把文件改成了二进制。用 `git diff --text` 就能查看文字差异。
